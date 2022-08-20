@@ -527,8 +527,17 @@ def _handler(irc, hostmask, args):
         irc.debug('Logging in (no SASL, aww)...')
         irc.msg('NickServ', 'identify ' + irc.ns_identity)
     if irc.channels:
-        irc.debug('*** Joining channels...', irc.channels)
-        irc.quote('JOIN', ','.join(irc.channels))
+        names = []
+        keys = []
+        for channel in irc.channels:
+            [name, key] = channel.split(' ', 2)
+            if name:
+                names.append(name)
+            if key:
+                keys.append(key)
+
+        irc.debug('*** Joining channels...', names)
+        irc.quote('JOIN', ','.join(irc.channels), ','.join(keys))
 
     with irc._send_lock:
         sendq, irc.sendq = irc.sendq, None
