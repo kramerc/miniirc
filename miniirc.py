@@ -629,7 +629,9 @@ def _handler(irc, hostmask, args):
         names = []
         keys = []
         for channel in irc.channels:
-            [name, key] = channel.split(' ', 2)
+            bits = channel.split(' ', 2)
+            name = bits[0]
+            key = bits[1] if len(bits) > 1 else None
             if name:
                 names.append(name)
             if key:
