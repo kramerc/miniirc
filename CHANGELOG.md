@@ -8,6 +8,46 @@ Notes:
  - This changelog may contain typographical errors, it is still a
     work-in-progress.
 
+## 1.9.1 - 2022-12-14
+
+### Changed
+
+ - Fixed handling of socket timeouts when trying to recover nickname
+ - The socket is now closed if there's a connection timeout while writing data
+   since the socket may have partially written data.
+ - Removed use of the deprecated `socket.error`
+
+## 1.9.0 - 2022-12-13
+
+### Added
+
+ - miniirc will now attempt to regain the originally specified nickname if it
+   cannot used when connecting. For compatibility, `irc.nick` will return the
+   current nickname while connected, however changing it will change the
+   desired nickname. This may change in the future.
+
+### Changed
+
+ - The current nickname is now obtained from the 001 response after connecting.
+
+## 1.8.4 - 2022-08-22
+
+### Changed
+
+ - Fixed a socket-related oversight in v1.8.3.
+
+## 1.8.3 - 2022-08-22
+
+### Changed
+
+ - Receiving from the SSL socket is now done with a lock to prevent sending and
+   receiving at the same time (which can break with SSL). This should fix
+   random disconnects with Ubuntu 22.04 / OpenSSL 3.
+ - Because of the above change, `irc.sock` is now non-blocking and things that
+   call `irc.sock.settimeout()` may break the connection or cause deadlocks.
+    - `irc.sock` hasn't been in the API documentation and has been deprecated
+      for a while.
+
 ## 1.8.2 - 2022-04-26
 
 ### Added

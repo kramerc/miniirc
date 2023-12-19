@@ -5,18 +5,18 @@
 # © 2018-2022 by luk3yx and other contributors of miniirc.
 #
 
-import atexit, errno, threading, time, socket, ssl, sys, warnings
+import atexit, threading, time, select, socket, ssl, sys, warnings
 
 # The version string and tuple
-ver = __version_info__ = (1,8,2)
-version = 'miniirc IRC framework v1.8.2'
-__version__ = '1.8.2'
+ver = __version_info__ = (1, 9, 1)
+version = 'miniirc IRC framework v1.9.1'
+__version__ = '1.9.1'
 
 # __all__ and _default_caps
 __all__ = ['CmdHandler', 'Handler', 'IRC']
 _default_caps = {'account-tag', 'away-notify', 'cap-notify', 'chghost',
-    'draft/message-tags-0.2', 'invite-notify', 'message-tags',
-    'oragono.io/maxline-2', 'server-time', 'sts'}
+                 'draft/message-tags-0.2', 'invite-notify', 'message-tags',
+                 'oragono.io/maxline-2', 'server-time', 'sts'}
 
 # Get the certificate list.
 try:
@@ -28,6 +28,7 @@ except ImportError:
 # Create global handlers
 _global_handlers = {}
 _colon_warning = False
+
 
 def _add_handler(handlers, events, ircv3, cmd_arg, colon):
     if (colon and _colon_warning and
@@ -51,21 +52,29 @@ def _add_handler(handlers, events, ircv3, cmd_arg, colon):
                 handlers[event].append(func)
 
         f = getattr(func, '__func__', func)
-        if ircv3:   f.miniirc_ircv3     = True
-        if cmd_arg: f.miniirc_cmd_arg   = True
-        if colon:   f.miniirc_colon     = True
+        if ircv3:
+            f.miniirc_ircv3 = True
+        if cmd_arg:
+            f.miniirc_cmd_arg = True
+        if colon:
+            f.miniirc_colon = True
         return func
 
     return add_handler
 
+
 def Handler(*events, ircv3=False, colon=True):
     return _add_handler(_global_handlers, events, ircv3, False, colon)
+
 
 def CmdHandler(*events, ircv3=False, colon=True):
     return _add_handler(_global_handlers, events, ircv3, True, colon)
 
+
 # Parse IRCv3 tags
 ircv3_tag_escapes = {':': ';', 's': ' ', 'r': '\r', 'n': '\n'}
+
+
 def _tags_to_dict(tag_list, separator=';'):
     tags = {}
     if separator:
@@ -75,10 +84,10 @@ def _tags_to_dict(tag_list, separator=';'):
         if len(tag) == 1:
             tags[tag[0]] = True
         elif len(tag) == 2:
-            if '\\' in tag[1]: # Iteration is bad, only do it if required.
+            if '\\' in tag[1]:  # Iteration is bad, only do it if required.
                 value = ''
                 escape = False
-                for char in tag[1]: # TODO: Remove this iteration.
+                for char in tag[1]:  # TODO: Remove this iteration.
                     if escape:
                         value += ircv3_tag_escapes.get(char, char)
                         escape = False
@@ -91,6 +100,7 @@ def _tags_to_dict(tag_list, separator=';'):
             tags[tag[0]] = value
 
     return tags
+
 
 # Create the IRCv2/3 parser
 def ircv3_message_parser(msg):
@@ -133,12 +143,14 @@ def ircv3_message_parser(msg):
     # Return the parsed data
     return cmd, hostmask, tags, args
 
+
 # Escape tags
 def _escape_tag(tag):
     tag = str(tag).replace('\\', '\\\\')
     for i in ircv3_tag_escapes:
         tag = tag.replace(ircv3_tag_escapes[i], '\\' + i)
     return tag
+
 
 # Convert a dict into an IRCv3 tags string
 def _dict_to_tags(tags):
@@ -156,6 +168,7 @@ def _dict_to_tags(tags):
         return b''
     return res[:-1] + b' '
 
+
 # A wrapper for callable logfiles
 class _Logfile:
     __slots__ = ('_buffer', '_func', '_lock')
@@ -172,11 +185,13 @@ class _Logfile:
         self._func = func
         self._lock = threading.Lock()
 
+
 # Replace invalid RFC1459 characters with Unicode lookalikes
 def _prune_arg(arg):
     if arg.startswith(':'):
         arg = '\u0703' + arg[1:]
     return arg.replace(' ', '\xa0').replace('\r', '\xa0').replace('\n', '\xa0')
+
 
 # Create the IRC class
 class IRC:
@@ -189,7 +204,17 @@ class IRC:
     _unhandled_caps = None
 
     # This will no longer be an alias in miniirc v2.0.0.
-    current_nick = property(lambda self : self.nick)
+    # This is still a property to avoid breaking miniirc_matrix
+    current_nick = property(lambda self: self._current_nick)
+
+    # For backwards compatibility, irc.nick will return the current nickname.
+    # However, changing irc.nick will change the desired nickname as well
+    # TODO: Consider changing what irc.nick does if it won't break anything or
+    # making desired_nick public
+    @current_nick.setter
+    def nick(self, new_nick):
+        self._desired_nick = new_nick
+        self._current_nick = new_nick
 
     def __init__(self, ip, port, nick, channels=None, *, ssl=None, ident=None,
                  realname=None, persist=True, debug=False, ns_identity=None,
@@ -215,6 +240,7 @@ class IRC:
         self.ping_interval = ping_interval
         self.ping_timeout = ping_timeout
         self.verify_ssl = verify_ssl
+        self._keepnick_active = False
         self._executor = executor
 
         # Set the NickServ identity
@@ -283,9 +309,42 @@ class IRC:
         if tags:
             msg = _dict_to_tags(tags) + msg
 
+        # Non-blocking sockets can't use sendall() reliably
+        msg += b'\r\n'
         self._send_lock.acquire()
-        try: # Apparently try/finally is faster than "with".
-            self.sock.sendall(msg + b'\r\n')
+        sent_bytes = 0
+        try:  # Apparently try/finally is faster than "with".
+            while True:
+                try:
+                    # Attempt to send to the socket
+                    sent_bytes += self.sock.send(msg[sent_bytes:])
+                except ssl.SSLWantReadError:
+                    # Wait for the socket to become ready again
+                    readable, _, _ = select.select(
+                        (self.sock,), (), (self.sock,),
+                        self.ping_timeout or self.ping_interval
+                    )
+                    continue
+                except (BlockingIOError, ssl.SSLWantWriteError):
+                    pass
+                else:
+                    # Break if enough data has been written
+                    if sent_bytes >= len(msg):
+                        break
+
+                # Otherwise wait for the socket to become writable
+                select.select((), (self.sock,), (self.sock,),
+                              self.ping_timeout or self.ping_interval)
+        except socket.timeout:
+            # Abort the connection if there was a timeout because the data may
+            # have been partially written
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+
+            if force:
+                raise
         except (AttributeError, BrokenPipeError):
             if force:
                 raise
@@ -295,7 +354,7 @@ class IRC:
     def send(self, *msg, force=None, tags=None):
         if len(msg) > 1:
             self.quote(*tuple(map(_prune_arg, msg[:-1])) + (':' + msg[-1],),
-                force=force, tags=tags)
+                       force=force, tags=tags)
         else:
             self.quote(*msg, force=force, tags=tags)
 
@@ -348,14 +407,15 @@ class IRC:
             self.sock = ctx.wrap_socket(self.sock, server_hostname=self.ip)
 
         # Begin IRCv3 CAP negotiation.
+        self._current_nick = self._desired_nick
         self._unhandled_caps = None
         self.quote('CAP LS 302', force=True)
         self.quote('USER', self.ident, '0', '*', ':' + self.realname,
-            force=True)
-        self.quote('NICK', self.nick, force=True)
+                   force=True)
+        self.quote('NICK', self._desired_nick, force=True)
         atexit.register(self.disconnect)
         self.debug('Starting main loop...')
-        self._sasl = self._pinged = False
+        self._sasl = self._pinged = self._keepnick_active = False
         self._start_main_loop()
 
     def _start_main_loop(self):
@@ -371,6 +431,7 @@ class IRC:
         self.connected = None
         self.active_caps.clear()
         atexit.unregister(self.disconnect)
+        self._current_nick = self._desired_nick
         self._unhandled_caps = None
         try:
             self.quote('QUIT :' + str(msg or self.quit_message), force=True)
@@ -438,35 +499,63 @@ class IRC:
         cap = cap.lower()
         self.active_caps.add(cap)
         if self._unhandled_caps and cap in self._unhandled_caps:
-            handled = self._handle('IRCv3 ' + cap,
-                ('CAP', 'CAP', 'CAP'), {}, self._unhandled_caps[cap])
+            handled = self._handle(
+                'IRCv3 ' + cap, ('CAP', 'CAP', 'CAP'), {},
+                self._unhandled_caps[cap]
+            )
             if not handled:
                 self.finish_negotiation(cap)
 
     # The main loop
     def _main(self):
+        # Make the socket non-blocking.
+        self.sock.setblocking(False)
+
         self.debug('Main loop running!')
         buffer = b''
         while True:
             try:
                 assert len(buffer) < 65535, 'Very long line detected!'
                 try:
-                    raw = self.sock.recv(8192).replace(b'\r', b'\n')
+                    # Acquire the send lock when receiving data because I don't
+                    # think you're supposed to call SSL functions from multiple
+                    # threads at once
+                    self._send_lock.acquire()
+                    try:
+                        raw = self.sock.recv(8192).replace(b'\r', b'\n')
+                    finally:
+                        self._send_lock.release()
+
                     if not raw:
                         raise ConnectionAbortedError
                     buffer += raw
-                except socket.timeout:
-                    if self._pinged:
-                        raise
-                    else:
+                except (BlockingIOError, ssl.SSLWantReadError):
+                    # Wait for the socket to become ready again
+                    readable, _, _ = select.select(
+                        (self.sock,), (), (self.sock,),
+
+                        # self.ping_interval should be used when
+                        # self.ping_timeout is None
+                        (self._pinged and self.ping_timeout or
+                         self.ping_interval)
+                    )
+
+                    # Handle ping timeouts
+                    if not readable:
+                        if self._pinged:
+                            raise TimeoutError
                         self._pinged = True
-                        if self.ping_timeout:
-                            self.sock.settimeout(self.ping_timeout)
                         self.quote('PING', ':miniirc-ping', force=True)
-                except socket.error as e:
-                    if e.errno != errno.EWOULDBLOCK:
-                        raise
-            except (OSError, socket.error) as e:
+                except ssl.SSLWantWriteError:
+                    select.select((), (self.sock,), (self.sock,),
+                                  self.ping_timeout or self.ping_interval)
+
+                # Attempt to change nicknames every 30 seconds
+                if (self._keepnick_active and
+                        time.monotonic() > self._last_keepnick_attempt + 30):
+                    self.send('NICK', self._desired_nick, force=True)
+                    self._last_keepnick_attempt = time.monotonic()
+            except OSError as e:
                 self.debug('Lost connection!', repr(e))
                 self.disconnect(auto_reconnect=True)
                 while self.persist:
@@ -474,7 +563,7 @@ class IRC:
                     self.debug('Reconnecting...')
                     try:
                         self.connect()
-                    except (OSError, socket.error):
+                    except OSError:
                         self.debug('Failed to reconnect!')
                         self.connected = None
                     else:
@@ -490,7 +579,7 @@ class IRC:
                     self.debug('<<<', line)
                     try:
                         result = self._parse(line)
-                    except:
+                    except Exception:
                         result = None
                     if isinstance(result, tuple) and len(result) == 4:
                         self._handle(*result)
@@ -512,20 +601,30 @@ class IRC:
         if not self._main_thread or not self._main_thread.is_alive():
             self._start_main_loop()
 
+
 # Handle some IRC messages by default.
 @Handler('001')
 def _handler(irc, hostmask, args):
     irc.connected = True
     irc.isupport.clear()
     irc._unhandled_caps = None
-    if irc.ping_interval:
-        irc.sock.settimeout(irc.ping_interval)
     irc.debug('Connected!')
+
+    # Update the current nickname and activate keepnick if required
+    irc._last_keepnick_attempt = time.monotonic()
+    irc._keepnick_active = args[0] != irc._desired_nick
+    irc._current_nick = args[0]
+
+    # Apply connection modes
     if irc.connect_modes:
-        irc.quote('MODE', irc.nick, irc.connect_modes)
+        irc.quote('MODE', irc.current_nick, irc.connect_modes)
+
+    # Log into NickServ if required
     if not irc._sasl and irc.ns_identity:
         irc.debug('Logging in (no SASL, aww)...')
         irc.msg('NickServ', 'identify ' + irc.ns_identity)
+
+    # Join channels
     if irc.channels:
         names = []
         keys = []
@@ -539,41 +638,50 @@ def _handler(irc, hostmask, args):
         irc.debug('*** Joining channels...', names)
         irc.quote('JOIN', ','.join(irc.channels), ','.join(keys))
 
+    # Send any queued messages
     with irc._send_lock:
         sendq, irc.sendq = irc.sendq, None
     if sendq:
         for i in sendq:
             irc.quote(*i)
 
+
 @Handler('PING', colon=True)
 def _handler(irc, hostmask, args):
     irc.quote('PONG', *args, force=True)
+
 
 @Handler('PONG', colon=False)
 def _handler(irc, hostmask, args):
     if args and args[-1] == 'miniirc-ping' and irc.ping_interval:
         irc._pinged = False
-        if irc.ping_timeout:
-            irc.sock.settimeout(irc.ping_interval)
+
 
 @Handler('432', '433')
 def _handler(irc, hostmask, args):
     if not irc.connected:
         try:
-            return int(irc.nick[0])
-        except:
+            return int(irc._current_nick[0])
+        except ValueError:
             pass
-        if len(irc.nick) >= irc.isupport.get('NICKLEN', 20):
+        if len(irc._current_nick) >= irc.isupport.get('NICKLEN', 20):
             return
-        irc.debug('WARNING: The requested nickname', repr(irc.nick), 'is '
-            'invalid. Trying again with', repr(irc.nick + '_') + '...')
-        irc.nick += '_'
-        irc.quote('NICK', irc.nick, force=True)
+        irc.debug('WARNING: The requested nickname', repr(irc._current_nick),
+                  'is invalid. Trying again with',
+                  repr(irc._current_nick + '_') + '...')
+        irc._current_nick += '_'
+        irc.quote('NICK', irc.current_nick, force=True)
+
 
 @Handler('NICK', colon=False)
 def _handler(irc, hostmask, args):
-    if hostmask[0].lower() == irc.nick.lower():
-        irc.nick = args[-1]
+    if hostmask[0].lower() == irc._current_nick.lower():
+        irc._current_nick = args[-1]
+
+        # Deactivate keepnick if the client has the right nickname
+        if irc._current_nick.lower() == irc._desired_nick.lower():
+            irc._keepnick_active = False
+
 
 @Handler('PRIVMSG', colon=False)
 def _handler(irc, hostmask, args):
@@ -581,6 +689,7 @@ def _handler(irc, hostmask, args):
         return
     if args[-1].startswith('\x01VERSION') and args[-1].endswith('\x01'):
         irc.ctcp(hostmask[0], 'VERSION', version, reply=True)
+
 
 # Handle IRCv3 capabilities
 @Handler('CAP', colon=False)
@@ -622,15 +731,17 @@ def _handler(irc, hostmask, args):
             if cap in irc.active_caps:
                 irc.active_caps.remove(cap)
 
+
 # SASL
 @Handler('IRCv3 SASL')
 def _handler(irc, hostmask, args):
     if irc.ns_identity and (len(args) < 2 or 'PLAIN' in
-            args[-1].upper().split(',')):
+                            args[-1].upper().split(',')):
         irc.quote('AUTHENTICATE PLAIN', force=True)
     else:
         irc.quote('AUTHENTICATE *', force=True)
         irc.finish_negotiation('sasl')
+
 
 @Handler('AUTHENTICATE', colon=False)
 def _handler(irc, hostmask, args):
@@ -641,15 +752,18 @@ def _handler(irc, hostmask, args):
         pw = '{0}\x00{0}\x00{1}'.format(*pw).encode('utf-8')
         irc.quote('AUTHENTICATE', b64encode(pw).decode('utf-8'), force=True)
 
+
 @Handler('904', '905')
 def _handler(irc, hostmask, args):
     if irc._sasl:
         irc._sasl = False
         irc.quote('AUTHENTICATE *', force=True)
 
+
 @Handler('902', '903', '904', '905')
 def _handler(irc, hostmask, args):
     irc.finish_negotiation('sasl')
+
 
 # STS
 @Handler('IRCv3 STS')
@@ -675,6 +789,7 @@ def _handler(irc, hostmask, args):
     else:
         irc.finish_negotiation('sts')
 
+
 # Maximum line length
 @Handler('IRCv3 oragono.io/maxline-2')
 def _handler(irc, hostmask, args):
@@ -684,6 +799,7 @@ def _handler(irc, hostmask, args):
         pass
 
     irc.finish_negotiation(args[0])
+
 
 # Handle ISUPPORT messages
 @Handler('005')
@@ -696,15 +812,34 @@ def _handler(irc, hostmask, args):
     for key in isupport:
         try:
             isupport[key] = int(isupport[key])
-            if key == 'NICKLEN':
-                irc.nick = irc.nick[:isupport[key]]
-        except:
+
+            # Disable keepnick if the nickname is too long
+            if key == 'NICKLEN' and len(irc._desired_nick) > isupport[key]:
+                irc._keepnick_active = False
+        except ValueError:
             if key.endswith('LEN'):
                 remove.add(key)
     for key in remove:
         del isupport[key]
 
     irc.isupport.update(isupport)
+
+
+# Attempt to get the desired nickname if the user that currently has it quits
+@Handler('QUIT', 'NICK')
+def _handler(irc, hostmask, args):
+    if (irc.connected and irc._keepnick_active and
+            hostmask[0].lower() == irc._desired_nick.lower()):
+        irc.send('NICK', irc._desired_nick, force=True)
+        irc._last_keepnick_attempt = time.monotonic()
+
+
+# Stop trying to get the desired nickname if it's invalid or if nick changes
+# aren't permitted
+@Handler('432', '435', '447')
+def _handler(irc, hostmask, args):
+    irc._keepnick_active = False
+
 
 _colon_warning = True
 del _handler
